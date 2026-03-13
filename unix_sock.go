@@ -136,6 +136,7 @@ func handleConn(c *UnixSocketContext, conn *net.UnixConn) {
 		select {
 		case c.queue <- packed:
 		case <-c.stop:
+			fmt.Println("[gunixsocket] connection close")
 			return
 		}
 	}
@@ -159,6 +160,7 @@ func FLBPluginInputCallback(data *unsafe.Pointer, size *C.size_t) int {
 
 //export FLBPluginInputCleanupCallback
 func FLBPluginInputCleanupCallback(data unsafe.Pointer) int {
+	fmt.Println("[gunixsocket] FLBPluginInputCleanupCallback")
 	close(ctx.stop)
 	ctx.listener.Close()
 	ctx.wg.Wait()
@@ -174,6 +176,7 @@ func FLBPluginInputCleanupCallback(data unsafe.Pointer) int {
 
 //export FLBPluginExit
 func FLBPluginExit() int {
+	fmt.Println("[gunixsocket] FLBPluginExit")
 	return input.FLB_OK
 }
 
