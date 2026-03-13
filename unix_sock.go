@@ -80,7 +80,7 @@ func FLBPluginInit(plugin unsafe.Pointer) int {
 		queue:      make(chan []byte, 4096),
 		stop:       make(chan struct{}),
 		socketPath: path,
-		removeSock: true, // 退出时是否删除 socket
+		removeSock: false, // 退出时是否删除 socket
 	}
 
 	ctx.wg.Add(1)
