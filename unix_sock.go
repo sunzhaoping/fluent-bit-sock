@@ -17,12 +17,13 @@ import (
 	"github.com/fluent/fluent-bit-go/input"
 )
 
-// UnixSocketContext 保存插件状态
 type UnixSocketContext struct {
-	listener *net.UnixListener
-	queue    chan []byte
-	stop     chan struct{}
-	wg       sync.WaitGroup
+	listener   *net.UnixListener
+	queue      chan []byte
+	stop       chan struct{}
+	wg         sync.WaitGroup
+	socketPath string
+	removeSock bool
 }
 
 var ctx *UnixSocketContext
@@ -40,7 +41,13 @@ func FLBPluginInit(plugin unsafe.Pointer) int {
 	}
 
 	fmt.Println("[gunixsocket] socket path:", path)
-	os.Remove(path)
+
+	// 只在文件存在时删除
+	if _, err := os.Stat(path); err == nil {
+		if err := os.Remove(path); err != nil {
+			fmt.Println("[gunixsocket] remove existing socket failed:", err)
+		}
+	}
 
 	permStr := input.FLBPluginConfigKey(plugin, "Perm")
 	if permStr == "" {
@@ -51,8 +58,6 @@ func FLBPluginInit(plugin unsafe.Pointer) int {
 		fmt.Println("[gunixsocket] invalid perm, using 0644")
 		perm = 0644
 	}
-
-	fmt.Println("[gunixsocket] path:", path, "perm:", fmt.Sprintf("%04o", perm))
 
 	addr, err := net.ResolveUnixAddr("unix", path)
 	if err != nil {
@@ -71,9 +76,11 @@ func FLBPluginInit(plugin unsafe.Pointer) int {
 	}
 
 	ctx = &UnixSocketContext{
-		listener: listener,
-		queue:    make(chan []byte, 4096), // 缓存队列
-		stop:     make(chan struct{}),
+		listener:   listener,
+		queue:      make(chan []byte, 4096),
+		stop:       make(chan struct{}),
+		socketPath: path,
+		removeSock: true, // 退出时是否删除 socket
 	}
 
 	ctx.wg.Add(1)
@@ -85,12 +92,12 @@ func FLBPluginInit(plugin unsafe.Pointer) int {
 // 接收连接循环
 func acceptLoop(c *UnixSocketContext) {
 	defer c.wg.Done()
-
 	for {
 		conn, err := c.listener.AcceptUnix()
 		if err != nil {
 			select {
 			case <-c.stop:
+				fmt.Println("[gunixsocket] accept stopped")
 				return
 			default:
 				fmt.Println("[gunixsocket] accept error:", err)
@@ -144,11 +151,10 @@ func FLBPluginInputCallback(data *unsafe.Pointer, size *C.size_t) int {
 	case msg := <-ctx.queue:
 		*data = C.CBytes(msg)
 		*size = C.size_t(len(msg))
+		return input.FLB_OK
 	default:
-		// 没有数据
 		return input.FLB_OK
 	}
-	return input.FLB_OK
 }
 
 //export FLBPluginInputCleanupCallback
@@ -156,6 +162,13 @@ func FLBPluginInputCleanupCallback(data unsafe.Pointer) int {
 	close(ctx.stop)
 	ctx.listener.Close()
 	ctx.wg.Wait()
+
+	if ctx.removeSock {
+		if err := os.Remove(ctx.socketPath); err != nil {
+			fmt.Println("[gunixsocket] remove socket failed:", err)
+		}
+	}
+
 	return input.FLB_OK
 }
 
