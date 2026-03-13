@@ -57,7 +57,7 @@ func FLBPluginInit(plugin unsafe.Pointer) int {
 	fmt.Println("[gunixsocket] path:", path, "mode:", mode, "perm:", fmt.Sprintf("%04o", perm))
 
 	// 删除已存在 socket 文件
-	os.Remove(path)
+	// os.Remove(path)
 
 	if mode != "tcp" && mode != "udp" {
 		fmt.Println("[gunixsocket] unsupported mode, must be tcp or udp")
