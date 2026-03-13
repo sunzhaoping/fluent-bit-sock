@@ -11,6 +11,7 @@ import (
 	"net"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 	"unsafe"
@@ -118,60 +119,68 @@ func handleConn(c *UnixSocketContext, conn *net.UnixConn) {
 
 	scanner := bufio.NewScanner(conn)
 	for scanner.Scan() {
-		line := scanner.Text()
 		now := time.Now()
 		flbTime := input.FLBTime{Time: now}
 
-		// 先尝试解析成 Forward Protocol 数组
-		var arr []interface{}
-		var record map[string]interface{}
-		tag := "default"
-
-		if err := json.Unmarshal([]byte(line), &arr); err == nil && len(arr) == 3 {
-			// 第一项是 tag
-			if t, ok := arr[0].(string); ok {
-				tag = t
+		line := scanner.Text()
+		line = strings.ReplaceAll(line, "][", "]\n[")
+		for _, subline := range strings.Split(line, "\n") {
+			subline = strings.TrimSpace(subline)
+			if subline == "" {
+				continue
 			}
 
-			// 第三项是 record
-			if r, ok := arr[2].(map[string]interface{}); ok {
-				record = r
+			// 先尝试解析成 Forward Protocol 数组
+			var arr []interface{}
+			var record map[string]interface{}
+			tag := "default"
+
+			if err := json.Unmarshal([]byte(subline), &arr); err == nil && len(arr) == 3 {
+				// 第一项是 tag
+				if t, ok := arr[0].(string); ok {
+					tag = t
+				}
+
+				// 第三项是 record
+				if r, ok := arr[2].(map[string]interface{}); ok {
+					record = r
+				} else {
+					// 第三项不是 map，就用字符串包装
+					record = map[string]interface{}{
+						"message": fmt.Sprintf("%v", arr[2]),
+					}
+				}
 			} else {
-				// 第三项不是 map，就用字符串包装
-				record = map[string]interface{}{
-					"message": fmt.Sprintf("%v", arr[2]),
+				// 不是 Forward Protocol 数组，尝试解析成普通 JSON
+				if err := json.Unmarshal([]byte(subline), &record); err != nil {
+					// 都解析不了，就直接用 message 字段
+					record = map[string]interface{}{
+						"message": subline,
+					}
 				}
 			}
-		} else {
-			// 不是 Forward Protocol 数组，尝试解析成普通 JSON
-			if err := json.Unmarshal([]byte(line), &record); err != nil {
-				// 都解析不了，就直接用 message 字段
-				record = map[string]interface{}{
-					"message": line,
-				}
+
+			// 构造 entry
+			entry := []interface{}{flbTime, record}
+
+			enc := input.NewEncoder()
+			packed, err := enc.Encode(entry)
+			if err != nil {
+				fmt.Println("[gunixsocket] encode error:", err)
+				continue
 			}
+
+			// 发送到 queue
+			select {
+			case c.queue <- packed:
+			case <-c.stop:
+				fmt.Println("[gunixsocket] stop signal received")
+				return
+			}
+
+			// 打印 tag （可选，用于调试）
+			fmt.Println("[gunixsocket] tag:", tag)
 		}
-
-		// 构造 entry
-		entry := []interface{}{flbTime, record}
-
-		enc := input.NewEncoder()
-		packed, err := enc.Encode(entry)
-		if err != nil {
-			fmt.Println("[gunixsocket] encode error:", err)
-			continue
-		}
-
-		// 发送到 queue
-		select {
-		case c.queue <- packed:
-		case <-c.stop:
-			fmt.Println("[gunixsocket] stop signal received")
-			return
-		}
-
-		// 打印 tag （可选，用于调试）
-		fmt.Println("[gunixsocket] tag:", tag)
 	}
 
 	if err := scanner.Err(); err != nil {
