@@ -6,6 +6,7 @@ package main
 import "C"
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
 	"net"
 	"os"
@@ -121,9 +122,16 @@ func handleConn(c *UnixSocketContext, conn *net.UnixConn) {
 		now := time.Now()
 		flbTime := input.FLBTime{Time: now}
 
-		record := map[string]string{
-			"log": line,
+		// 试着解析成 JSON，如果不是 JSON，就直接用 string
+		var record map[string]interface{}
+		if err := json.Unmarshal([]byte(line), &record); err != nil {
+			// 不是 JSON 的话，用字符串也可以
+			record = map[string]interface{}{
+				"message": line,
+			}
 		}
+
+		// 直接把 record 放到 entry，去掉 "log" 包装
 		entry := []interface{}{flbTime, record}
 
 		enc := input.NewEncoder()
@@ -136,7 +144,7 @@ func handleConn(c *UnixSocketContext, conn *net.UnixConn) {
 		select {
 		case c.queue <- packed:
 		case <-c.stop:
-			fmt.Println("[gunixsocket] connection")
+			fmt.Println("[gunixsocket] stop signal received")
 			return
 		}
 	}
