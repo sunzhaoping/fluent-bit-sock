@@ -222,9 +222,7 @@ func handleConn(c *UnixSocketContext, conn *net.UnixConn) {
 			// =========================
 			out := make(map[string]interface{})
 
-			for k, v := range record.Record {
-				out[k] = v
-			}
+			out["record"] = record.Record
 
 			if record.TableName != "" {
 				out["table_name"] = record.TableName
