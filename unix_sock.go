@@ -4,6 +4,7 @@ package main
 #include <stdlib.h>
 */
 import "C"
+
 import (
 	"bufio"
 	"encoding/json"
@@ -30,6 +31,54 @@ type UnixSocketContext struct {
 
 var ctx *UnixSocketContext
 
+// =========================
+// LogRecord（核心）
+// =========================
+
+type LogRecord struct {
+	TableName    string                 `json:"table_name"`
+	TableVersion string                 `json:"table_version"`
+	Record       map[string]interface{} `json:"record"`
+}
+
+// 支持 record = JSON 或 string(JSON)
+func (d *LogRecord) UnmarshalJSON(data []byte) error {
+	type Alias struct {
+		TableName    string          `json:"table_name"`
+		TableVersion string          `json:"table_version"`
+		Record       json.RawMessage `json:"record"`
+	}
+
+	var a Alias
+	if err := json.Unmarshal(data, &a); err != nil {
+		return err
+	}
+
+	d.TableName = a.TableName
+	d.TableVersion = a.TableVersion
+
+	if len(a.Record) == 0 {
+		d.Record = make(map[string]interface{})
+		return nil
+	}
+
+	// 👇 string 包 JSON
+	if a.Record[0] == '"' {
+		var s string
+		if err := json.Unmarshal(a.Record, &s); err != nil {
+			return err
+		}
+		return json.Unmarshal([]byte(s), &d.Record)
+	}
+
+	// 👇 正常 JSON
+	return json.Unmarshal(a.Record, &d.Record)
+}
+
+// =========================
+// Plugin 注册
+// =========================
+
 //export FLBPluginRegister
 func FLBPluginRegister(def unsafe.Pointer) int {
 	return input.FLBPluginRegister(def, "gunixsocket", "Unix Socket Text Input Plugin")
@@ -44,45 +93,39 @@ func FLBPluginInit(plugin unsafe.Pointer) int {
 
 	fmt.Println("[gunixsocket] socket path:", path)
 
-	// 只在文件存在时删除
 	if _, err := os.Stat(path); err == nil {
-		if err := os.Remove(path); err != nil {
-			fmt.Println("[gunixsocket] remove existing socket failed:", err)
-		}
+		os.Remove(path)
 	}
 
 	permStr := input.FLBPluginConfigKey(plugin, "Perm")
 	if permStr == "" {
 		permStr = "0644"
 	}
+
 	perm, err := strconv.ParseUint(permStr, 8, 32)
 	if err != nil {
-		fmt.Println("[gunixsocket] invalid perm, using 0644")
 		perm = 0644
 	}
 
 	addr, err := net.ResolveUnixAddr("unix", path)
 	if err != nil {
-		fmt.Println("[gunixsocket] resolve addr error:", err)
+		fmt.Println("resolve error:", err)
 		return input.FLB_ERROR
 	}
 
 	listener, err := net.ListenUnix("unix", addr)
 	if err != nil {
-		fmt.Println("[gunixsocket] listen error:", err)
+		fmt.Println("listen error:", err)
 		return input.FLB_ERROR
 	}
 
-	if err := os.Chmod(path, os.FileMode(perm)); err != nil {
-		fmt.Println("[gunixsocket] chmod error:", err)
-	}
+	os.Chmod(path, os.FileMode(perm))
 
 	ctx = &UnixSocketContext{
 		listener:   listener,
 		queue:      make(chan []byte, 4096),
 		stop:       make(chan struct{}),
 		socketPath: path,
-		removeSock: false, // 退出时是否删除 socket
 	}
 
 	ctx.wg.Add(1)
@@ -91,18 +134,21 @@ func FLBPluginInit(plugin unsafe.Pointer) int {
 	return input.FLB_OK
 }
 
-// 接收连接循环
+// =========================
+// accept loop
+// =========================
+
 func acceptLoop(c *UnixSocketContext) {
 	defer c.wg.Done()
+
 	for {
 		conn, err := c.listener.AcceptUnix()
 		if err != nil {
 			select {
 			case <-c.stop:
-				fmt.Println("[gunixsocket] accept stopped")
 				return
 			default:
-				fmt.Println("[gunixsocket] accept error:", err)
+				fmt.Println("accept error:", err)
 				continue
 			}
 		}
@@ -112,81 +158,110 @@ func acceptLoop(c *UnixSocketContext) {
 	}
 }
 
-// 处理单个连接
+// =========================
+// 核心处理逻辑
+// =========================
+
 func handleConn(c *UnixSocketContext, conn *net.UnixConn) {
 	defer conn.Close()
 	defer c.wg.Done()
 
 	scanner := bufio.NewScanner(conn)
+
 	for scanner.Scan() {
 		now := time.Now()
 		flbTime := input.FLBTime{Time: now}
 
 		line := scanner.Text()
 		line = strings.ReplaceAll(line, "][", "]\n[")
+
 		for _, subline := range strings.Split(line, "\n") {
 			subline = strings.TrimSpace(subline)
 			if subline == "" {
 				continue
 			}
 
-			// 先尝试解析成 Forward Protocol 数组
-			var arr []interface{}
-			var record map[string]interface{}
+			var record LogRecord
 			tag := "default"
 
+			// =========================
+			// 1️⃣ Forward Protocol
+			// =========================
+			var arr []interface{}
 			if err := json.Unmarshal([]byte(subline), &arr); err == nil && len(arr) == 3 {
-				// 第一项是 tag
+
 				if t, ok := arr[0].(string); ok {
 					tag = t
 				}
 
-				// 第三项是 record
-				if r, ok := arr[2].(map[string]interface{}); ok {
-					record = r
-				} else {
-					// 第三项不是 map，就用字符串包装
-					record = map[string]interface{}{
-						"message": fmt.Sprintf("%v", arr[2]),
+				raw, _ := json.Marshal(arr[2])
+
+				if err := json.Unmarshal(raw, &record); err != nil {
+					record = LogRecord{
+						TableName:    "unknown",
+						TableVersion: "v1",
+						Record:       map[string]interface{}{"message": fmt.Sprintf("%v", arr[2])},
 					}
 				}
+
 			} else {
-				// 不是 Forward Protocol 数组，尝试解析成普通 JSON
+				// =========================
+				// 2️⃣ 普通 JSON / LogRecord
+				// =========================
 				if err := json.Unmarshal([]byte(subline), &record); err != nil {
-					// 都解析不了，就直接用 message 字段
-					record = map[string]interface{}{
-						"message": subline,
+					record = LogRecord{
+						TableName:    "unknown",
+						TableVersion: "v1",
+						Record:       map[string]interface{}{"message": subline},
 					}
 				}
 			}
 
-			// 构造 entry
-			entry := []interface{}{flbTime, record}
+			// =========================
+			// 3️⃣ flatten 输出
+			// =========================
+			out := make(map[string]interface{})
+
+			for k, v := range record.Record {
+				out[k] = v
+			}
+
+			if record.TableName != "" {
+				out["table_name"] = record.TableName
+				tag = record.TableName // 👈 自动当 tag
+			}
+
+			if record.TableVersion != "" {
+				out["table_version"] = record.TableVersion
+			}
+
+			entry := []interface{}{flbTime, out}
 
 			enc := input.NewEncoder()
 			packed, err := enc.Encode(entry)
 			if err != nil {
-				fmt.Println("[gunixsocket] encode error:", err)
+				fmt.Println("encode error:", err)
 				continue
 			}
 
-			// 发送到 queue
 			select {
 			case c.queue <- packed:
 			case <-c.stop:
-				fmt.Println("[gunixsocket] stop signal received")
 				return
 			}
 
-			// 打印 tag （可选，用于调试）
 			fmt.Println("[gunixsocket] tag:", tag)
 		}
 	}
 
 	if err := scanner.Err(); err != nil {
-		fmt.Println("[gunixsocket] scanner error:", err)
+		fmt.Println("scanner error:", err)
 	}
 }
+
+// =========================
+// Fluent Bit 回调
+// =========================
 
 //export FLBPluginInputCallback
 func FLBPluginInputCallback(data *unsafe.Pointer, size *C.size_t) int {
@@ -194,30 +269,19 @@ func FLBPluginInputCallback(data *unsafe.Pointer, size *C.size_t) int {
 	case msg := <-ctx.queue:
 		*data = C.CBytes(msg)
 		*size = C.size_t(len(msg))
-		return input.FLB_OK
 	default:
-		return input.FLB_OK
 	}
-}
-
-//export FLBPluginInputCleanupCallback
-func FLBPluginInputCleanupCallback(data unsafe.Pointer) int {
-	fmt.Println("[gunixsocket] FLBPluginInputCleanupCallback")
 	return input.FLB_OK
 }
 
 //export FLBPluginExit
 func FLBPluginExit() int {
-	fmt.Println("[gunixsocket] FLBPluginExit")
-
 	close(ctx.stop)
 	ctx.listener.Close()
 	ctx.wg.Wait()
 
 	if ctx.removeSock {
-		if err := os.Remove(ctx.socketPath); err != nil {
-			fmt.Println("[gunixsocket] remove socket failed:", err)
-		}
+		os.Remove(ctx.socketPath)
 	}
 
 	return input.FLB_OK
