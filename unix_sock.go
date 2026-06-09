@@ -6,6 +6,7 @@ package main
 import "C"
 
 import (
+	"path/filepath"
 	"bufio"
 	"encoding/json"
 	"fmt"
@@ -90,6 +91,12 @@ func FLBPluginInit(plugin unsafe.Pointer) int {
 	if path == "" {
 		path = "/tmp/fluent.sock"
 	}
+
+	dir := filepath.Dir(path)
+    if err := os.MkdirAll(dir, 0755); err != nil {
+        fmt.Println("create socket dir error:", err)
+        return input.FLB_ERROR
+    }
 
 	fmt.Println("[gunixsocket] socket path:", path)
 
