@@ -6,19 +6,38 @@ package main
 import "C"
 
 import (
-	"path/filepath"
-	"bufio"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"os"
+	"path/filepath"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 	"unsafe"
 
 	"github.com/fluent/fluent-bit-go/input"
+)
+
+// Fixes against the original unix_sock.go (2026-06-09 build):
+//  1. FLBPluginInputCallback drained only ONE record per collector tick (1s)
+//     -> hard cap of 1 record/s per instance, everything else piled up in
+//     blocked handleConn goroutines and was lost on instance rotation.
+//     Now the callback drains the whole queue (bounded by maxFlushBytes).
+//  2. bufio.Scanner (ScanLines, 64KB max token) was used on a stream that has
+//     no newlines (fluent-logger-php JsonPacker) -> "token too long" dropped a
+//     whole connection's records. Now json.Decoder parses concatenated JSON
+//     values directly, with no size limit.
+//  3. Event time now comes from the forward-protocol time field (arr[1])
+//     instead of time.Now(), so backlog does not shift timestamps.
+//  4. Per-record fmt.Println removed (journal noise).
+//  5. FLBPluginInputCleanupCallback added so the buffer handed to C is freed
+//     (requires fluent-bit >= 2.0).
+
+const (
+	queueSize     = 65536           // records buffered between conns and collector
+	maxFlushBytes = 4 * 1024 * 1024 // max msgpack bytes returned per collector tick
 )
 
 type UnixSocketContext struct {
@@ -33,7 +52,7 @@ type UnixSocketContext struct {
 var ctx *UnixSocketContext
 
 // =========================
-// LogRecord（核心）
+// LogRecord
 // =========================
 
 type LogRecord struct {
@@ -42,7 +61,7 @@ type LogRecord struct {
 	Record       map[string]interface{} `json:"record"`
 }
 
-// 支持 record = JSON 或 string(JSON)
+// record may be a JSON object or a string containing JSON
 func (d *LogRecord) UnmarshalJSON(data []byte) error {
 	type Alias struct {
 		TableName    string          `json:"table_name"`
@@ -63,7 +82,6 @@ func (d *LogRecord) UnmarshalJSON(data []byte) error {
 		return nil
 	}
 
-	// 👇 string 包 JSON
 	if a.Record[0] == '"' {
 		var s string
 		if err := json.Unmarshal(a.Record, &s); err != nil {
@@ -72,12 +90,11 @@ func (d *LogRecord) UnmarshalJSON(data []byte) error {
 		return json.Unmarshal([]byte(s), &d.Record)
 	}
 
-	// 👇 正常 JSON
 	return json.Unmarshal(a.Record, &d.Record)
 }
 
 // =========================
-// Plugin 注册
+// Plugin registration
 // =========================
 
 //export FLBPluginRegister
@@ -93,10 +110,10 @@ func FLBPluginInit(plugin unsafe.Pointer) int {
 	}
 
 	dir := filepath.Dir(path)
-    if err := os.MkdirAll(dir, 0755); err != nil {
-        fmt.Println("create socket dir error:", err)
-        return input.FLB_ERROR
-    }
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		fmt.Println("create socket dir error:", err)
+		return input.FLB_ERROR
+	}
 
 	fmt.Println("[gunixsocket] socket path:", path)
 
@@ -130,7 +147,7 @@ func FLBPluginInit(plugin unsafe.Pointer) int {
 
 	ctx = &UnixSocketContext{
 		listener:   listener,
-		queue:      make(chan []byte, 4096),
+		queue:      make(chan []byte, queueSize),
 		stop:       make(chan struct{}),
 		socketPath: path,
 	}
@@ -166,116 +183,139 @@ func acceptLoop(c *UnixSocketContext) {
 }
 
 // =========================
-// 核心处理逻辑
+// connection handling
 // =========================
 
 func handleConn(c *UnixSocketContext, conn *net.UnixConn) {
 	defer conn.Close()
 	defer c.wg.Done()
 
-	scanner := bufio.NewScanner(conn)
+	// json.Decoder consumes concatenated JSON values ("[..][..]" with no
+	// delimiter) and has no fixed token size limit.
+	dec := json.NewDecoder(conn)
 
-	for scanner.Scan() {
-		now := time.Now()
-		flbTime := input.FLBTime{Time: now}
-
-		line := scanner.Text()
-		line = strings.ReplaceAll(line, "][", "]\n[")
-
-		for _, subline := range strings.Split(line, "\n") {
-			subline = strings.TrimSpace(subline)
-			if subline == "" {
-				continue
+	for {
+		var raw json.RawMessage
+		if err := dec.Decode(&raw); err != nil {
+			if err != io.EOF {
+				fmt.Println("decode error:", err)
 			}
-
-			var record LogRecord
-			tag := "default"
-
-			// =========================
-			// 1️⃣ Forward Protocol
-			// =========================
-			var arr []interface{}
-			if err := json.Unmarshal([]byte(subline), &arr); err == nil && len(arr) == 3 {
-
-				if t, ok := arr[0].(string); ok {
-					tag = t
-				}
-
-				raw, _ := json.Marshal(arr[2])
-
-				if err := json.Unmarshal(raw, &record); err != nil {
-					record = LogRecord{
-						TableName:    "unknown",
-						TableVersion: "v1",
-						Record:       map[string]interface{}{"message": fmt.Sprintf("%v", arr[2])},
-					}
-				}
-
-			} else {
-				// =========================
-				// 2️⃣ 普通 JSON / LogRecord
-				// =========================
-				if err := json.Unmarshal([]byte(subline), &record); err != nil {
-					record = LogRecord{
-						TableName:    "unknown",
-						TableVersion: "v1",
-						Record:       map[string]interface{}{"message": subline},
-					}
-				}
-			}
-
-			// =========================
-			// 3️⃣ flatten 输出
-			// =========================
-			out := make(map[string]interface{})
-
-			out["record"] = record.Record
-
-			if record.TableName != "" {
-				out["table_name"] = record.TableName
-				tag = record.TableName // 👈 自动当 tag
-			}
-
-			if record.TableVersion != "" {
-				out["table_version"] = record.TableVersion
-			}
-
-			entry := []interface{}{flbTime, out}
-
-			enc := input.NewEncoder()
-			packed, err := enc.Encode(entry)
-			if err != nil {
-				fmt.Println("encode error:", err)
-				continue
-			}
-
-			select {
-			case c.queue <- packed:
-			case <-c.stop:
-				return
-			}
-
-			fmt.Println("[gunixsocket] tag:", tag)
+			return
 		}
-	}
 
-	if err := scanner.Err(); err != nil {
-		fmt.Println("scanner error:", err)
+		if !enqueue(c, raw) {
+			return
+		}
 	}
 }
 
+// parseEventTime converts the forward-protocol time field (int/float seconds)
+// into time.Time; falls back to now.
+func parseEventTime(v interface{}) time.Time {
+	switch t := v.(type) {
+	case float64:
+		if t > 0 {
+			sec := int64(t)
+			nsec := int64((t - float64(sec)) * 1e9)
+			return time.Unix(sec, nsec)
+		}
+	case json.Number:
+		if f, err := t.Float64(); err == nil && f > 0 {
+			sec := int64(f)
+			nsec := int64((f - float64(sec)) * 1e9)
+			return time.Unix(sec, nsec)
+		}
+	}
+	return time.Now()
+}
+
+// enqueue parses one JSON value, flattens it and pushes it to the queue.
+// Returns false when the plugin is stopping.
+func enqueue(c *UnixSocketContext, raw json.RawMessage) bool {
+	var record LogRecord
+	eventTime := time.Now()
+
+	// 1) forward protocol: ["tag", time, {record}]
+	var arr []interface{}
+	if err := json.Unmarshal(raw, &arr); err == nil && len(arr) == 3 {
+		eventTime = parseEventTime(arr[1])
+
+		payload, _ := json.Marshal(arr[2])
+		if err := json.Unmarshal(payload, &record); err != nil {
+			record = LogRecord{
+				TableName:    "unknown",
+				TableVersion: "v1",
+				Record:       map[string]interface{}{"message": fmt.Sprintf("%v", arr[2])},
+			}
+		}
+	} else {
+		// 2) plain JSON / LogRecord
+		if err := json.Unmarshal(raw, &record); err != nil {
+			record = LogRecord{
+				TableName:    "unknown",
+				TableVersion: "v1",
+				Record:       map[string]interface{}{"message": string(raw)},
+			}
+		}
+	}
+
+	// 3) flatten
+	out := make(map[string]interface{})
+	out["record"] = record.Record
+	if record.TableName != "" {
+		out["table_name"] = record.TableName
+	}
+	if record.TableVersion != "" {
+		out["table_version"] = record.TableVersion
+	}
+
+	entry := []interface{}{input.FLBTime{Time: eventTime}, out}
+
+	enc := input.NewEncoder()
+	packed, err := enc.Encode(entry)
+	if err != nil {
+		fmt.Println("encode error:", err)
+		return true
+	}
+
+	select {
+	case c.queue <- packed:
+	case <-c.stop:
+		return false
+	}
+	return true
+}
+
 // =========================
-// Fluent Bit 回调
+// Fluent Bit callbacks
 // =========================
 
 //export FLBPluginInputCallback
 func FLBPluginInputCallback(data *unsafe.Pointer, size *C.size_t) int {
-	select {
-	case msg := <-ctx.queue:
-		*data = C.CBytes(msg)
-		*size = C.size_t(len(msg))
-	default:
+	var buf []byte
+
+drain:
+	for len(buf) < maxFlushBytes {
+		select {
+		case msg := <-ctx.queue:
+			buf = append(buf, msg...)
+		default:
+			break drain
+		}
 	}
+
+	if len(buf) == 0 {
+		return input.FLB_OK
+	}
+
+	*data = C.CBytes(buf)
+	*size = C.size_t(len(buf))
+	return input.FLB_OK
+}
+
+//export FLBPluginInputCleanupCallback
+func FLBPluginInputCleanupCallback(data unsafe.Pointer) int {
+	C.free(data)
 	return input.FLB_OK
 }
 
